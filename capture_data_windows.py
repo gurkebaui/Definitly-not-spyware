@@ -20,6 +20,7 @@ class DataRecorder:
         self.running = True
         self.events = []
         self.start_time = 0
+        self.mouse_controller = mouse.Controller()
         
         # Directory Setup
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -44,6 +45,8 @@ class DataRecorder:
         try: k = key.char
         except: k = str(key)
         self.log_event("key_press", {"key": k})
+
+
 
     def capture_audio(self):
         print("[Stream] Mic Recording Started...")
@@ -84,8 +87,29 @@ class DataRecorder:
             
             out.release()
 
+    def capture_mouse_trajectory(self):
+        """
+        NEU: Speichert die Mausposition kontinuierlich (30Hz).
+        Das ist essenziell für flüssige Bewegungen.
+        """
+        print("[Stream] Mouse Trajectory Tracking Started...")
+        while self.running:
+            loop_start = time.time()
+            
+            # Position holen
+            x, y = self.mouse_controller.position
+            
+            # Loggen als 'mouse_pos' Event
+            # Wir speichern KEIN Button-State hier, das machen die Listener
+            self.log_event("mouse_pos", {"x": x, "y": y})
+            
+            # 30 Hz Taktung (0.033s)
+            elapsed = time.time() - loop_start
+            wait = max(0, 0.033 - elapsed)
+            time.sleep(wait)
+
     def run(self):
-        # Start Inputs
+        # Start Listeners (für Klicks & Tasten)
         m_listener = mouse.Listener(on_click=self.on_click)
         k_listener = keyboard.Listener(on_press=self.on_key)
         m_listener.start()
@@ -93,24 +117,29 @@ class DataRecorder:
 
         self.start_time = time.time()
         
-        # Start Threads
+        # Threads starten
         t_vid = threading.Thread(target=self.capture_video)
         t_aud = threading.Thread(target=self.capture_audio)
+        
+        # NEU: Thread für Maus-Bewegung
+        t_mouse = threading.Thread(target=self.capture_mouse_trajectory)
+        
         t_vid.start()
         t_aud.start()
+        t_mouse.start() # Startet das Tracking
         
         print("\n=== RECORDING ACTIVE ===")
-        print("Speak your actions! (e.g., 'I am opening the menu')")
-        print("Press CTRL+C to stop.\n")
+        # ... Rest bleibt gleich ...
         
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n[Stopping] Finalizing files...")
+            # ... cleanup ...
             self.running = False
             t_vid.join()
             t_aud.join()
+            t_mouse.join() # Warten bis Mouse-Thread beendet ist
             m_listener.stop()
             k_listener.stop()
             
