@@ -1,20 +1,19 @@
 import time
 import json
 import threading
-import subprocess
-import sys
 import os
-import signal
-# pynput will be installed by the setup script
-try:
-    from pynput import mouse, keyboard
-except ImportError:
-    print("pynput not found. Please run 'pip install pynput'")
-    sys.exit(1)
+import sys
+import cv2
+import numpy as np
+import mss
+import sounddevice as sd
+import soundfile as sf
+from pynput import mouse, keyboard
 
-# Config
-OUTPUT_DIR = os.path.expanduser("~/Documents/ChimeraData") # Better default for Windows
+# CONFIG
+OUTPUT_DIR = os.path.expanduser("~/Documents/ChimeraData")
 FPS = 30
+SAMPLE_RATE = 16000 # 16kHz is standard for AI Audio
 
 class DataRecorder:
     def __init__(self):
@@ -22,124 +21,105 @@ class DataRecorder:
         self.events = []
         self.start_time = 0
         
-        # Create directory
+        # Directory Setup
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.session_dir = os.path.join(OUTPUT_DIR, f"session_{timestamp}")
         os.makedirs(self.session_dir, exist_ok=True)
         
         self.video_path = os.path.join(self.session_dir, "screen.mp4")
+        self.audio_path = os.path.join(self.session_dir, "microphone.wav")
         self.log_path = os.path.join(self.session_dir, "events.jsonl")
         
-        print(f"=== CHIMERA DATA RECORDER (WINDOWS) ===")
-        print(f"Storage: {self.session_dir}")
-        print(f"Controls: Recording starts immediately. Press CTRL+C to save & stop.")
+        print(f"[Storage] {self.session_dir}")
 
     def log_event(self, event_type, data):
         if not self.running: return
         t = time.time() - self.start_time
-        entry = {
-            "t": t,
-            "type": event_type,
-            "data": data
-        }
-        self.events.append(entry)
+        self.events.append({"t": t, "type": event_type, "data": data})
 
-    # --- MOUSE CALLBACKS ---
-    def on_move(self, x, y):
-        self.log_event("mouse_move", {"x": x, "y": y})
-
+    # --- INPUT LISTENERS ---
     def on_click(self, x, y, button, pressed):
         self.log_event("mouse_click", {"x": x, "y": y, "button": str(button), "pressed": pressed})
-
-    def on_scroll(self, x, y, dx, dy):
-        self.log_event("mouse_scroll", {"x": x, "y": y, "dx": dx, "dy": dy})
-
-    # --- KEYBOARDCALLBACKS ---
-    def on_key_press(self, key):
+    def on_key(self, key):
         try: k = key.char
         except: k = str(key)
         self.log_event("key_press", {"key": k})
 
-    def on_key_release(self, key):
-        try: k = key.char
-        except: k = str(key)
-        self.log_event("key_release", {"key": k})
+    def capture_audio(self):
+        print("[Stream] Mic Recording Started...")
+        # Open stream
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1) as stream:
+            with sf.SoundFile(self.audio_path, mode='w', samplerate=SAMPLE_RATE, channels=1) as file:
+                while self.running:
+                    # Read 1024 frames (approx 60ms)
+                    data, overflow = stream.read(1024)
+                    file.write(data)
 
-    def start_ffmpeg(self):
-        # FFmpeg Command for Windows (gdigrab)
-        # Note: Audio recording on Windows requires a specific DirectShow device name.
-        # This script captures VIDEO ONLY to ensure compatibility.
-        # To add audio, you would need: -f dshow -i audio="Microphone (Realtek Audio)"
-        
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f", "gdigrab", 
-            "-framerate", str(FPS),
-            "-i", "desktop",
-            "-c:v", "libx264", 
-            "-preset", "ultrafast", 
-            "-crf", "25",
-            self.video_path
-        ]
-        
-        self.ff_log = open(os.path.join(self.session_dir, "ffmpeg.log"), "w")
-        
-        print("[Recorder] Starting FFmpeg (Screen)...\n")
-        # Creation flag specifically for Windows to hide the console window of ffmpeg if run in background
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NO_WINDOW
+    def capture_video(self):
+        print("[Stream] Screen Recording Started...")
+        with mss.mss() as sct:
+            monitor = sct.monitors[1] # Primary
+            # Define Codec
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(self.video_path, fourcc, FPS, (monitor["width"], monitor["height"]))
             
-        self.process = subprocess.Popen(cmd, stdout=self.ff_log, stderr=self.ff_log, stdin=subprocess.PIPE, creationflags=creationflags)
-        
+            while self.running:
+                loop_start = time.time()
+                
+                # Grab Frame
+                img = np.array(sct.grab(monitor))
+                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                
+                # Mouse Cursor Overlay (Visual feedback for World Model)
+                # Note: We record the cursor visually so Phase 1 (World Model) can see it
+                # Getting cursor pos requires pynput or ctypes, skipping for pure speed here
+                # relying on inverse dynamics to learn cursor position.
+                
+                out.write(frame)
+                
+                # FPS Lock
+                elapsed = time.time() - loop_start
+                wait = max(0, (1.0/FPS) - elapsed)
+                time.sleep(wait)
+            
+            out.release()
+
     def run(self):
-        m_listener = mouse.Listener(on_move=self.on_move, on_click=self.on_click, on_scroll=self.on_scroll)
-        k_listener = keyboard.Listener(on_press=self.on_key_press, on_release=self.on_key_release)
-        
+        # Start Inputs
+        m_listener = mouse.Listener(on_click=self.on_click)
+        k_listener = keyboard.Listener(on_press=self.on_key)
         m_listener.start()
         k_listener.start()
-        
+
         self.start_time = time.time()
-        self.start_ffmpeg()
         
-        print("\n[REC] RECORDING ACTIVE.")
-        print("      Stop with CTRL+C in this terminal.\n")
+        # Start Threads
+        t_vid = threading.Thread(target=self.capture_video)
+        t_aud = threading.Thread(target=self.capture_audio)
+        t_vid.start()
+        t_aud.start()
+        
+        print("\n=== RECORDING ACTIVE ===")
+        print("Speak your actions! (e.g., 'I am opening the menu')")
+        print("Press CTRL+C to stop.\n")
         
         try:
             while self.running:
-                time.sleep(0.1)
+                time.sleep(1)
         except KeyboardInterrupt:
-            print("\n[Recorder] Stopping...")
-        finally:
+            print("\n[Stopping] Finalizing files...")
             self.running = False
-            
-            if self.process:
-                try:
-                    self.process.communicate(input=b'q', timeout=3)
-                except:
-                    self.process.terminate()
-                self.process.wait()
-                self.ff_log.close()
-            
+            t_vid.join()
+            t_aud.join()
             m_listener.stop()
             k_listener.stop()
             
-            print(f"[Recorder] Saving {len(self.events)} input events...")
+            print(f"[Save] {len(self.events)} events logged.")
             with open(self.log_path, 'w') as f:
                 for e in self.events:
                     f.write(json.dumps(e) + "\n")
-            
-            print(f"[Done] Session saved to: {self.session_dir}")
+            print("Done.")
 
 if __name__ == "__main__":
-    # Simple check if ffmpeg is reachable
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        print("Error: 'ffmpeg' is not installed or not in PATH.")
-        print("Please install FFmpeg and add it to your System PATH.")
-        sys.exit(1)
-        
     rec = DataRecorder()
     rec.run()
